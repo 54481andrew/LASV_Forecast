@@ -1,0 +1,596 @@
+### *****************************
+
+## Uses fitted models and monthly precipitation averages to forecast
+## rodent trap success or viral prevalence three months ahead of the
+## most recent rainfall data. Forecast is generated for Sierra Leone
+## and Guinea.
+
+## Outline of code
+## Step 1: Read in the raster data
+## Step 2: Apply model to weather time-series, save monthly raster predictions
+## Step 3: Generate jpg of forecasts, make a gif
+
+## Predictions are output to directory named similar to
+## full.forecast.path <- paste0('../../Storage/Forecasts/BRTv1_', prefix, '_Radius', radius) 
+
+## To run on IBEST server
+## ## Load R module
+## module load R/3.5.1
+## ## Run R
+## R
+
+### *****************************
+
+### --- USER INPUT
+
+prefix <-  'v3_captures_StaticN_tc1_a5_nb10_res5' ## Name of model
+include.types <- 0
+
+## Option to calculate forecast rasters. If FALSE, forecasts are loaded from file
+calcRasts <- TRUE
+
+## First date that is predicted; choose 1-2 years before present date if interested
+## in GIF movie
+start.date.preds <- as.Date('2020-01-01')
+
+## Option to download fitted models from ibest server. Set to false if running on
+## server. Can be useful for running models on the server, debugging subsequent
+## steps on home computer. 
+download.models <- FALSE
+
+## Specify where the forecast rasters will be saved -- created if it does not exist
+full.forecast.path <- paste0('../../Storage/Forecasts/XGB/', prefix) 
+
+## - Specify folder that contains predictor stacks
+raster.data.path <- "../../Storage/Raster_Data"
+
+## - Specify location of MODIS monthly precipitation rasters
+prec.path <- '../../Storage/Raster_Data/Original_Data/MODIS_Precip'
+
+## - Specify shapefile (West Africa) path and layer name
+shapefile.path <- paste('../../Storage/Shapefiles/West_Africa', sep = '')
+shapefile.name <- 'foc'
+
+### --- END USER INPUT
+
+
+
+
+### --- Load packages
+
+## Dynamically load gdal and local packages
+library(raster)
+library(sf)
+library(rgdal)
+library(MASS)
+library(lubridate)
+library(zoo)
+library(parallel)
+library(fields)
+library(viridis)
+library(ggplot2)
+library(xgboost)
+library(rgdal)
+
+## Store current directory
+home.dir <- getwd()
+
+## Load in shapefile of west african countries
+foc.shp.ogr <- readOGR(dsn = shapefile.path,
+                       layer = shapefile.name, verbose = FALSE)
+
+
+## - Location of mastomys natalensis rangemap for masking
+masto.rangemap <-readOGR(dsn = paste('../../Storage/Shapefiles/Masto_Range', sep = ''), layer = 'data_0', verbose = FALSE)
+
+## Define locations of model data and models
+models.info.path <-  paste0('Figures_Fits/XGB/', prefix, '/')
+models.path <-paste0(models.info.path, 'Model_Fits')
+data.path <- paste0(models.info.path, 'Data_Files')
+
+## --- Load in data from IBEST server
+
+if(download.models){
+    dir.create(models.path, recursive = TRUE, showWarnings = FALSE)
+    cmd <- paste0("rsync -av --exclude='Model_Fits' --exclude='Data_Files' abasinski@fortyfour.ibest.uidaho.edu:/mnt/ceph/abasinski/RDrop/Temporal_BRT_Rodent_Model_V1_1/Figures_Fits/BRT/",prefix,'/', " ~/Desktop/RDrop/Temporal_BRT_Rodent_Model_V1_1/Figures_Fits/XGB/",prefix,'/')
+    system(cmd)
+}
+
+
+## --- Get model names that must be loaded in
+
+## Load in full hyperparameter set that was run
+meta.grid <- read.csv(paste0(models.info.path, 'meta_filled.csv'))
+summary.fits <- read.csv(paste0(models.info.path, 'summary_fits.csv'))
+
+jj.meta.grid <- which(meta.grid$test.site=='none')
+parms <- unique(meta.grid[jj.meta.grid,])
+
+
+## Download corresponding models from the mathstat.uidaho server
+server.path <- paste0('abasinski@fortyfour.ibest.uidaho.edu:/mnt/ceph/abasinski/RDrop/Temporal_XGB_Rodent_Model_V1_1/Figures_Fits/XGB/',prefix,
+                      '/Model_Fits/')
+model.names <- paste0('mod', jj.meta.grid)
+full.model.names <- paste0(server.path, model.names)
+cmd <- paste("rsync -azP --exclude='Data_Files'", paste(full.model.names, collapse = ' '),
+             paste0(models.path, '/'),collapse = ' ')
+if(download.models){
+    system(cmd)
+}
+
+## --- Set up directory system in which to save forecasts
+
+## Define the names of storage directories
+raster.path <- paste0(full.forecast.path, '/Rasters/')
+house.tif.path <- paste0(full.forecast.path, '/Rasters/House/')
+intown.tif.path <- paste0(full.forecast.path, '/Rasters/InTown/')
+outtown.tif.path <- paste0(full.forecast.path, '/Rasters/OutTown/')
+house.lasv.tif.path <- paste0(full.forecast.path, '/Rasters/LASV_House/')
+avg.tif.path <- paste0(full.forecast.path, '/Rasters/Avg/')
+fig.path <- paste0(full.forecast.path, '/Figures/')
+
+## Create directory structure
+dir.create(path = fig.path, showWarnings = FALSE, recursive = TRUE)
+dir.create(path = house.tif.path, showWarnings = FALSE, recursive = TRUE)
+dir.create(path = house.lasv.tif.path, showWarnings = FALSE, recursive = TRUE)
+dir.create(path = intown.tif.path, showWarnings = FALSE, recursive = TRUE)
+dir.create(path = outtown.tif.path, showWarnings = FALSE, recursive = TRUE)
+dir.create(path = avg.tif.path, showWarnings = FALSE, recursive = TRUE)
+dir.create(path = fig.path, showWarnings = FALSE)
+dir.create(path = paste0(fig.path, 'house'), showWarnings = FALSE, recursive = TRUE)
+dir.create(path = paste0(fig.path, 'intown'), showWarnings = FALSE, recursive = TRUE)
+dir.create(path = paste0(fig.path, 'outtown'), showWarnings = FALSE, recursive = TRUE)
+dir.create(path = paste0(fig.path, 'avg'), showWarnings = FALSE, recursive = TRUE)
+dir.create(path = paste0(fig.path, 'coef'), showWarnings = FALSE, recursive = TRUE)
+dir.create(path = paste0(fig.path, 'lasv_risk'), showWarnings = FALSE, recursive = TRUE)
+dir.create(path = paste0(fig.path, 'movie_risk'), showWarnings = FALSE, recursive = TRUE)
+
+## --- Save version of parms to forecast path
+
+write.csv(file = paste0(full.forecast.path, '/Model_Parameters.csv'), parms, row.names = FALSE)
+
+
+## --- Option to manually define extent to which rasters are cropped
+
+## xlims = c(-15,-7.5) 
+## ylims = c(6.822, 12.7172) ## Covers northern Guinea to southern SL
+## ext.obj = extent(matrix(c(xlims, ylims), byrow = TRUE, ncol = 2)) 
+
+## --- Load in rainfall rasters only if form.complexity is temporal, set date information
+
+writeLines(paste0("\n\n *** ", prefix, " ***\n\n" ))
+
+writeLines('\n \n *** Reading in raster sets *** ')
+
+include.prec <- unique(parms$include.prec)
+if(length(include.prec) > 1){print('!!!WARNING: Ambiguous parameters'); q()}
+
+prec.names <- list.files(prec.path, pattern = 'tif')
+dates <- as.Date(gsub("\\.", "-", gsub("chirps.v2.0.", replacement = "", x = prec.names)))
+if(include.prec){
+    ## Load rasters that describe rainfall; extract date information
+
+    maxdate = max(as.Date(dates))
+    load.these <- which(dates > (start.date.preds - months(13)))
+    prec.dates <- dates[dates > (start.date.preds - months(13))]
+    dates <- dates[dates >= start.date.preds]
+
+    prec.names <- prec.names[load.these]
+    prec.stack <-stack( paste(prec.path, prec.names, sep = '/'))
+    
+    prec.names <- names(prec.stack)
+
+    ## Add 3 months beyond last available weather data
+    extradates = rep(maxdate, 3) 
+    month(extradates) = month(extradates) + 1:3
+    dates <- c(dates, extradates)
+    dates <- as.Date(dates)
+    
+    prec.dates <- c(prec.dates, extradates)
+    
+} ## End if checking whether include.prec == TRUE
+
+## Choose dummy date options if the model is static
+if(!include.prec){
+    
+    prec.stack <-stack( paste(prec.path, prec.names[1], sep = '/'))    
+    start.date.preds = Sys.Date() 
+    dates = Sys.Date()
+}
+
+## Choose extent from rainfall as default
+ext.obj <- extent(prec.stack)
+xlims = c(ext.obj@xmin, ext.obj@xmax)
+ylims = c(ext.obj@ymin, ext.obj@ymax)
+##prec.stack <- crop(prec.stack, ext.obj)
+
+ntimes <- length(dates)
+times <- seq(1,ntimes,length.out = ntimes)
+
+source("Tools/Functions.r")
+## --- Incorporate environmental and rainfall features into dataset
+
+pred.stack <- raster::stack(x = paste0(raster.data.path, "/predictor_stack_05.grd"))
+hab.preds <- names(pred.stack)
+hab.stack <- pred.stack
+
+
+rm(pred.stack) ## No longer needed in memory, so remove it
+gc()
+
+## --- Prepare Nights and Type rasters
+
+
+## Set up "Nights' raster variable
+zeros.rast <- hab.stack[[1]]*0.0
+zeros.rast <- crop(zeros.rast, ext.obj)
+night.rast <- zeros.rast + 1.0 ## Night
+names(night.rast) <- 'Night'
+
+## Define seperate feature stacks for house and intown predictions
+type.stack <- stack(c(zeros.rast, zeros.rast, zeros.rast))
+names(type.stack) <- c('House', 'InTown', 'OutTown')
+
+pop.rast <- raster::raster(paste0('../../Storage/Raster_Data/Original_Data/WorldPop_Population/AFR_PPP_2020_adj_v2.tif'))
+pop.rast <- crop(pop.rast, hab.stack[[1]])
+## Convert into density (# people / 1km2)
+pop.rast <- pop.rast / raster::area(pop.rast)
+res.pop.rast <- resample(pop.rast, hab.stack[[1]])
+
+## --- Apply model to monthly precipitation data
+## Define dataframe of dates on which to apply the model. A single NA date if model is static. 
+if(include.prec){
+    grid.dat <- expand.grid(Date = dates, Type = (c('House', 'InTown', 'OutTown')[1:include.types]))
+}
+if(!include.prec){
+    grid.dat <- expand.grid(Date = NA, Type = (c('House', 'InTown', 'OutTown')[1:include.types]))
+}
+
+
+
+mcl.fun <- function(ti){
+    library('raster')
+    library('xgboost')
+    ## Get focal date of prediction
+    cur.date <- grid.dat$Date[ti]
+    type <- paste(grid.dat$Type[ti])
+    rain.stack <- stack()
+    if(include.prec){
+        rain.names <- c()
+        ## Find position in prec.stack that corresponds to date in grid.dat
+        ti.stack <- which(prec.dates==cur.date)
+        for(i in seq(3,12, by = 1 )){
+            name <- paste('P', i, sep = '') ## Name given to new column
+            rain.pred <- prec.stack[[ti.stack - i]]
+            names(rain.pred) <- name
+            rain.stack <- stack(rain.stack, rain.pred)
+            rain.names <- c(rain.names, name)
+        }
+    }## End if rain.type=='block'
+    ## Join all features together into a single stack
+    type.stack[[type]] <- 1.0
+    feature.stack <- stack(hab.stack, res.pop.rast, rain.stack, night.rast, type.stack)
+    ## Define raster stack variables in which predictions will be saved
+    prediction.stack <- stack()
+    ## Load models and apply to predictor stack    
+    for(mod.i in jj.meta.grid){
+        model.name <- paste0(models.path, '/mod',mod.i, sep = '')
+        if(file.exists(model.name)){
+
+            ## --- Load model and predict in house and intown sites
+            xgb.mod <- xgb.load(model.name)
+
+            pred.names <- unlist(read.table(paste0(data.path, '/pred_names_',mod.i, '.txt', sep = '')),
+                                 use.names = FALSE)
+
+            pred.names <- pred.names[which((pred.names %in% names(feature.stack)))]      
+            rast.out <- predict(feature.stack[[pred.names]], xgb.mod, fun=xgb.pred)
+            
+            prediction.stack <- stack(prediction.stack, rast.out)
+            #print('a')
+        } ## Check if file exists
+    }## End loop through boots
+    ## Average together raster predictions and calculate standard deviation
+    mean.rast <- mean(prediction.stack)
+    sd.rast <- calc(prediction.stack, sd)    
+
+    if(include.prec){
+        ti.name.rast <- format(cur.date, '%m-%Y') 
+    }
+    if(!include.prec){
+        ti.name.rast <- 'Static' 
+    }
+    
+    ## Correct water body areas in raster predictions (shows up as NA, should be 0)
+    mean.rast[is.na(mean.rast)] <- 0
+    mean.rast <- mask(mean.rast, foc.shp.ogr, updatevalue = NA)
+    
+    ## Write rasters to file
+    tif.path <- ifelse(type=='House', house.tif.path,
+                ifelse(type=='InTown', intown.tif.path,
+                       outtown.tif.path))
+    writeRaster(x = mean.rast,
+                filename = paste(tif.path, ti.name.rast, '.tif', sep = ''),
+                overwrite = TRUE)    
+    
+    writeLines(paste('-Finished: ', ti, ' / ', nrow(grid.dat), '; Time: ', Sys.time() - starttime))
+
+
+    ## Return min, max of rasters (useful for plotting)
+    return(
+        data.frame(Date = grid.dat$Date[ti],
+                   Type = type,
+                   min.val = minValue(mean.rast),
+                   max.val = maxValue(mean.rast))
+    )
+} 
+
+## --- Calculate prediction rasters by calling the above function for each prediction timepoint 
+
+
+
+if(calcRasts){
+    starttime <- Sys.time()
+
+    send.vars <- ls(all = TRUE)
+    cl <- makeCluster(min(detectCores() - 2, nrow(grid.dat)), outfile= "")
+    clusterExport(cl, send.vars) #export input data to all cores
+    out <- parLapply(cl, 1:nrow(grid.dat), mcl.fun)
+    stopCluster(cl) 
+    
+    #out <- lapply(X = 1:nrow(grid.dat),
+    #                  FUN = mcl.fun)    
+    out <- data.frame(do.call(rbind, out))
+    print(paste('Total Time: ', Sys.time() - starttime), quote = FALSE)
+    write.csv(file = paste0(fig.path, '/out_info.csv'),
+              out, row.names = FALSE)
+}## End if calcRasts    
+
+    
+# ## Forecast
+# if(calcRasts){
+#     print('Building TIFs of predictions', quote = FALSE)
+#     starttime <- Sys.time()
+#     out <- mclapply(X = 1:nrow(grid.dat),
+#                     FUN = mcl.fun, mc.cores = detectCores() - 2)
+#     ##out <- lapply(X = 1:nrow(grid.dat),
+#     ##                  FUN = mcl.fun)
+#     out <- data.frame(do.call(rbind, out))
+#     print(paste('Total Time: ', Sys.time() - starttime), quote = FALSE)
+#     write.csv(file = paste0(fig.path, '/out_info.csv'),
+#               out, row.names = FALSE)
+# }## End if calcRasts
+
+## --- Define extent to which rasters are cropped
+xlims = c(-15,-7.5) 
+ylims = c(6.822, 12.7172) ## Covers northern Guinea to southern SL
+ext.obj = extent(matrix(c(xlims, ylims), byrow = TRUE, ncol = 2)) 
+
+## Location of LASV raster
+lasv.location <- '../Spatial_Forecast/PREEMPT/Pathogen_Layer/Figures_Fits/pathogen_v8/PRE_1_EFC_1_gen_1_mnode_1_pa_nboots_100_sig.at_0.9_tc_1_mllr_3_lmt_7_ambi_NA_mintest_5/Lassa_Layer_PRE_1_EFC_1_gen_1_mnode_1_pa_nboots_100_sig.at_0.9_tc_1_mllr_3_lmt_7_ambi_NA_mintest_5.tif'
+lasv.rast <- raster(lasv.location)
+##lasv.rast <- crop(lasv.rast, ext.obj)
+lasv.rast = mask(lasv.rast, masto.rangemap, updatevalue = 0)
+lasv.max <- maxValue(lasv.rast)
+
+## Corect lasv raster -- fill in NA water_bodies locations with 0
+lasv.rast[is.na(lasv.rast)] <- 0
+lasv.rast <- mask(lasv.rast, foc.shp.ogr, updatevalue = NA)
+jpeg( file = paste(fig.path, '/lasv_risk.jpg', sep = ''),
+     width = 6.25, height = 4.25, units = 'in', res = 400)
+par(mai = 1*c(0.2,0.1,0,0.5), omi = c(0,0,0.1,0))
+ticks <- seq(0,lasv.max, by = 0.1)
+heat.cols <- viridis((length(ticks) - 1), begin = 0.1, end = 1, option = 'D')
+image.plot(lasv.rast, col = heat.cols, zlim = c(0, lasv.max),
+           bty = 'n', xlab = '', ylab = '', xaxt = 'n', yaxt = 'n',
+           xlim = xlims, ylim = ylims,
+           asp = 1, legend.lab = 'Probability LASV Present', legend.line = 3,
+           main = '', bigplot = c(0,0.75,0.0,0.95), smallplot = c(0.80,0.84,0.1,0.9))
+plot(foc.shp.ogr, add = TRUE, bty = 'n', asp = 1, lwd = 3)
+dev.off()
+
+
+## --- Make plots of maps
+
+print('Build figures of predictions', quote = FALSE)
+out = read.csv(paste0(fig.path, '/out_info.csv'))
+
+## Store maximum value of risk for graphing on the preemptlassawestafrica webserver
+max.risk <- 0
+
+foc.shp.cropped <- raster::crop(foc.shp.ogr, ext.obj)
+
+for(type in c('house')){
+    
+    max.y <- max(subset(out, tolower(Type)==type, max.val))
+    zlim.y = ceiling(max.y*10)/10
+    zlim.y = 0.25
+    focal.tif.path <- get(paste0(type,'.tif.path'))
+    
+    lab.num <- 0
+    for(ti in which(dates==start.date.preds):length(dates)){
+        
+        if(include.prec){
+            lab.num <- lab.num + 1
+            time = times[ti]
+            cur.date <- dates[ti]
+            ti.name.rast <- format(dates[ti], '%m-%Y')
+            ti.name <- sprintf("pic%04d", lab.num)
+            timelabel <- format(dates[ti], '%b-%Y' )
+        }
+        if(!include.prec){
+            ti.name.rast = 'Static'
+            ti.name <- 'Static'
+            timelabel = ''
+        }
+        
+        
+        if(type != 'avg'){
+        ts.rast <- raster(paste(focal.tif.path, '/', ti.name.rast, '.tif', sep=''))
+        }else{
+            names <- c(house.tif.path, intown.tif.path)
+            ts.rast <- mean(stack(paste(names, '/', ti.name.rast, '.tif', sep='')))
+            writeRaster(ts.rast, filename = paste0(avg.tif.path, ti.name.rast, '.tif'),
+                        overwrite = TRUE)
+        }
+        
+        ## --- Build map of trap success
+        jpeg( file = paste(fig.path,type,'/', ti.name, '.jpg', sep = ''),
+             width = 6.25, height = 4.25, units = 'in', res = 400)
+        par(mai = 1*c(0.2,0.1,0,0.5), omi = c(0,0,0.1,0))
+        ticks <- seq(0,zlim.y, by = 0.0025)
+        heat.cols <- viridis((length(ticks) - 1), begin = 0.1, end = 1, option = 'D')
+        image.plot(ts.rast, col = heat.cols, zlim = c(0, zlim.y),
+                   bty = 'n', xlab = '', ylab = '', xaxt = 'n', yaxt = 'n',
+                   xlim = xlims, ylim = ylims,
+                   asp = 1, legend.lab = 'Predicted Trap Success', legend.line = 3,
+                   main = '', bigplot = c(0,0.75,0.0,0.95), smallplot = c(0.80,0.84,0.1,0.9))
+        mtext(text = paste0(paste(timelabel,sep = '')), side = 3, line = 0,
+              cex = 2)
+        plot(foc.shp.ogr, add = TRUE, bty = 'n', asp = 1, lwd = 3)
+        dev.off()
+        
+        ## Make LASV forecast in house sites
+        if(type=='house'){
+            lasv.risk <- ts.rast*lasv.rast
+            ## Save a copy lasv.risk raster as tif
+            ti.name.rast <- format(dates[ti], '%Y-%m') 
+            writeRaster(lasv.risk, filename = paste0(house.lasv.tif.path, '/forecast_', ti.name.rast, '.tif'), 
+                       overwrite = TRUE)
+            
+            max.risk <- max(max.risk, maxValue(lasv.risk))
+              
+            
+            jpeg( file = paste(fig.path, '/lasv_risk/', ti.name, '.jpg', sep = ''),
+                 width = 6.25, height = 4.25, units = 'in', res = 400)
+            par(mai = 1*c(0.2,0.1,0,0.5), omi = c(0,0,0.1,0))
+            ticks <- seq(0,lasv.max*zlim.y, by = 0.0001)
+            heat.cols <- viridis((length(ticks) - 1), begin = 0.1, end = 1, option = 'D')
+        image.plot(lasv.risk, col = heat.cols, zlim = c(0, lasv.max*zlim.y),
+                   bty = 'n', xlab = '', ylab = '', xaxt = 'n', yaxt = 'n',
+                   xlim = xlims, ylim = ylims,
+                   asp = 1, legend.lab = 'Predicted LASV Risk', legend.line = 3,
+                   main = '', bigplot = c(0,0.75,0.0,0.95), smallplot = c(0.80,0.84,0.1,0.9))
+            mtext(text = paste0(paste(timelabel,sep = '')), side = 3, line = 0,
+                  cex = 2)
+            plot(foc.shp.ogr, add = TRUE, bty = 'n', asp = 1, lwd = 3)
+        dev.off()
+            
+        ###******************************
+            
+        ## --Create images that will be used to create a GIF of the forecast
+            
+        lasv.max = maxValue(lasv.rast)
+        jpeg( file = paste(fig.path, '/movie_risk/', ti.name, '.jpg', sep = ''),
+             width = 6.25, height = 4.25, units = 'in', res = 400)
+        layout(matrix(c(1,2,3,4,5,6), nrow = 2, ncol = 3))
+        par(omi = c(0,0.35,0.0,0.3))
+        ticks <- seq(0,zlim.y, by = 0.0025)
+        heat.cols <- viridis((length(ticks) - 1), begin = 0.1, end = 1, option = 'D')
+        title.text <- bquote('   Risk of '*italic('M. natalensis')*' in house')
+        image.plot(crop(ts.rast, ext.obj), col = heat.cols, zlim = c(0, lasv.max*zlim.y),
+                   bty = 'n', xlab = '', ylab = '', xaxt = 'n', yaxt = 'n',
+                   asp = 1, legend.line = 3,
+                   xlim = xlims, ylim = ylims,                 
+                   main = '', bigplot = c(0,0.75,0.0,0.95), smallplot = c(0.80,0.84,0.2,0.75))
+        mtext(text = title.text, side = 3, line = -2,
+              cex = 1)
+        mtext(text = timelabel, side = 3, line = -3.25,
+              cex = 1)
+        plot(foc.shp.cropped, add = TRUE, bty = 'n', asp = 1, lwd = 1)    
+        plot.new()
+            
+        ticks <- seq(0,lasv.max, by = 0.1)    
+        heat.cols <- viridis((length(ticks) - 1), begin = 0.1, end = 1, option = 'D')
+        image.plot(crop(lasv.rast, ext.obj), col = heat.cols, zlim = c(0, lasv.max),
+                   bty = 'n', xlab = '', ylab = '', xaxt = 'n', yaxt = 'n',
+                   asp = 1, legend.line = 3,
+                   xlim = xlims, ylim = ylims,                   
+                   main = '', bigplot = c(0,0.75,0.0,0.95), smallplot = c(0.80,0.84,0.2,0.75))
+        mtext(text = paste0('Probability LASV occurs'), side = 3, line = -2,
+              cex = 1)
+        plot(foc.shp.cropped, add = TRUE, bty = 'n', asp = 1, lwd = 1)
+        plot.new()            
+
+        ticks <- seq(0,lasv.max*zlim.y, by = 0.0001)
+        heat.cols <- viridis((length(ticks) - 1), begin = 0.1, end = 1, option = 'D')
+        title.text <- 'Predicted LASV spillover risk'
+        image.plot(crop(lasv.risk, ext.obj), col = heat.cols, zlim = c(0, lasv.max*zlim.y),
+                   bty = 'n', xlab = '', ylab = '', xaxt = 'n', yaxt = 'n',
+                   asp = 1, legend.line = 3,
+                   xlim = xlims, ylim = ylims,                   
+                   main = '', bigplot = c(0,0.75,0.0,0.95), smallplot = c(0.80,0.84,0.2,0.75))
+        mtext(text = title.text, side = 3, line = -2,
+              cex = 1)
+        mtext(text = timelabel, side = 3, line = -3.25,
+              cex = 1)
+        plot(foc.shp.cropped, add = TRUE, bty = 'n', asp = 1, lwd = 1)
+        plot.new()
+        dev.off()
+
+            
+            ### --- 
+            
+     
+        }
+        
+        print(paste('Finished', ti, ' / ',  ntimes,'timelabel:', timelabel, sep = ' '), quote = FALSE)
+        
+    } ## Loop through time
+    
+    ## --- Make GIF movie of forecast    
+    
+    if(include.prec){    
+        setwd(paste0(fig.path,'/',type))
+        cmd <- paste('convert -delay 100 pic*.jpg -loop 0 ../../forecast_',type,'.gif',sep='')
+        system(cmd)
+        setwd(home.dir)
+
+        ## LASV Forecast
+        setwd(paste0(fig.path,'/lasv_risk'))
+        cmd <- paste('convert -delay 100 pic*.jpg -loop 0 ../../forecast_lasv_risk.gif',sep='')
+        system(cmd)
+        setwd(home.dir)
+     
+    }
+} ## Loop through site types, produce gifs and jpgs
+
+
+if(include.prec){
+    setwd(paste0(fig.path,'/movie_risk'))
+    cmd <- paste('convert -delay 100 pic*.jpg -loop 0 ../../forecast_movie.gif',sep='')
+    system(cmd)
+    setwd(home.dir)
+}
+## Load in last [nyears] years of rasters and average; the resulting mean raster will be
+## saved to file and used in Spatial Forecast models. 
+
+if(include.prec & include.types > 0){
+    nyears = 1
+    summ.dates <- dates[length(times) - 0:(nyears*12 - 1)]
+    summ.dates <- summ.dates[summ.dates >= start.date.preds]
+    summ.tif.names <- format(summ.dates, format = "%m-%Y")
+    ## House sites
+    focal.tif.path <- paste(house.tif.path, summ.tif.names, '.tif', sep='')
+    y.mean <- mean(stack(focal.tif.path))
+    
+    writeRaster(x = y.mean,
+                filename = paste(raster.path,'mean_TS_House.tif', sep = ''),
+                overwrite = TRUE)    
+    
+    ## in-town
+    if(include.types==2){
+    focal.tif.path <- paste(intown.tif.path, summ.tif.names, '.tif', sep='')
+    y.mean <- mean(stack(focal.tif.path))
+    writeRaster(x = y.mean,
+                filename = paste(raster.path,'mean_TS_InTown.tif', sep = ''),
+                overwrite = TRUE)    
+    }
+}
+## Save JSON file that describes the maximum observed risk
+text = paste0('max_val:', max.risk)
+cat(text,file=paste0(house.lasv.tif.path, "/max_val.json"))
+
+
+
+
